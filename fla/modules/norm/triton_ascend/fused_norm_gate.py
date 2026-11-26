@@ -17,7 +17,7 @@ import triton.language as tl
 
 from fla.backends import TritonAscendBackend, register
 from fla.modules.norm.fused_norm_gate import layer_norm_gated_bwd, layer_norm_gated_fwd
-from fla.utils import get_multiprocessor_count
+from fla.utils import get_device_arch, get_multiprocessor_count
 from fla.utils.ascend_ub_manager import ASCEND_MAX_GRID_DIM, compute_row_tile_block_size, compute_ub_block_size
 
 # peak live fp32 tiles relative to [BT, BD].
@@ -41,6 +41,9 @@ _LARGE_BD = 2048
 _LARGE_BD_FWD_MEM_MULT = 4.0
 _LARGE_BD_BWD_MEM_MULT = 12.0
 _LARGE_BD_BWD_RECOMPUTE_MEM_MULT = 16.5
+# calibrated UB budgets for Ascend 950DT under default multibuffering
+_ASCEND_950DT_FWD_MEM_MULT = 6.0
+_ASCEND_950DT_LARGE_BD_BWD_MEM_MULT = 24.0
 
 # ACTIVATION constexpr: 0 = swish/silu, 1 = sigmoid
 _ACTIVATION_SWISH = 0
@@ -62,22 +65,31 @@ def _tile_memory_multiplier(base: float, large_bd_mult: float, BD: int) -> float
     return base
 
 
+def _is_ascend_950dt() -> bool:
+    return get_device_arch().startswith("Ascend950DT")
+
+
 def _fwd_memory_multiplier(BD: int) -> float:
     """Return fwd tile multiplier; grid-stride + large BD needs more headroom."""
-    return _tile_memory_multiplier(base=_FWD_MEM_MULT, large_bd_mult=_LARGE_BD_FWD_MEM_MULT, BD=BD)
+    memory_multiplier = _tile_memory_multiplier(base=_FWD_MEM_MULT, large_bd_mult=_LARGE_BD_FWD_MEM_MULT, BD=BD)
+    if _is_ascend_950dt():
+        return max(memory_multiplier, _ASCEND_950DT_FWD_MEM_MULT)
+    return memory_multiplier
 
 
 def _bwd_memory_multiplier(is_rms_norm: bool, BD: int, *, recompute_output: bool = False) -> float:
     """Return bwd tile multiplier; larger BD needs a higher mult (smaller BT).
 
-    ``is_rms_norm`` is accepted for callers/host UB scripts; LN and RMS currently share the same calibrated budget.
+    LayerNorm and RMSNorm share the ordinary backward UB budget.
     ``recompute_output`` needs extra headroom because the kernel keeps pre-gate ``b_y`` live for the ``y`` store.
     """
-    # reserved if LN/RMS budgets diverge
     del is_rms_norm
     if recompute_output:
         return _tile_memory_multiplier(base=_BWD_RECOMPUTE_MEM_MULT, large_bd_mult=_LARGE_BD_BWD_RECOMPUTE_MEM_MULT, BD=BD)
-    return _tile_memory_multiplier(base=_BWD_MEM_MULT, large_bd_mult=_LARGE_BD_BWD_MEM_MULT, BD=BD)
+    memory_multiplier = _tile_memory_multiplier(base=_BWD_MEM_MULT, large_bd_mult=_LARGE_BD_BWD_MEM_MULT, BD=BD)
+    if BD >= _LARGE_BD and _is_ascend_950dt():
+        return max(memory_multiplier, _ASCEND_950DT_LARGE_BD_BWD_MEM_MULT)
+    return memory_multiplier
 
 
 def _get_layer_norm_gated_tiles(
@@ -117,6 +129,13 @@ def _get_layer_norm_gated_tiles(
         max_block=_MAX_BT,
     )
     return BD, BT
+
+
+def _wide_bwd_compile_kwargs(BD: int, *, recompute_output: bool = False) -> dict:
+    # use UB single-buffering to compile wide ordinary backward at BT=1 on Ascend 950DT
+    if not recompute_output and BD == 4096 and _is_ascend_950dt():
+        return {'multibuffer_mode': (('gm', 2), ('l0c', 2), ('l1', 2), ('ub', 1))}
+    return {}
 
 
 def _launch_config(
@@ -448,6 +467,7 @@ def layer_norm_gated_bwd_npu(
         HAS_WEIGHT=weight is not None,
         HAS_BIAS=bias is not None,
         RECOMPUTE_OUTPUT=y is not None,
+        **_wide_bwd_compile_kwargs(BD, recompute_output=recompute_output),
     )
     dw = dw.sum(0).to(weight.dtype) if weight is not None else None
     db = db.sum(0).to(bias.dtype) if bias is not None else None

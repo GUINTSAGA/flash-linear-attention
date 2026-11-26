@@ -17,19 +17,20 @@ from fla.modules import (
     FusedRMSNormSwishGateLinear,
 )
 from fla.modules.layernorm_gated import layernorm_fn
-from fla.utils import IS_NVIDIA_BLACKWELL, assert_close, device
+from fla.utils import IS_NPU, IS_NVIDIA_BLACKWELL, assert_close, device
 
 
 @pytest.mark.parametrize(
     ('B', 'H', 'T', 'D', 'elementwise_affine', 'activation', 'bias'),
     [
-        pytest.param(*test, id=f"B{test[0]}_H{test[1]}_T{test[2]}_D{test[3]}_affine{test[4]}_{test[5]}_bias{test[6]}")
-        for test in [
-            (2, 2, 1,    64,  False, "silu",   False),
-            (2, 2, 512,  128, True,  "silu",   True),
-            (2, 2, 2048, 1200, True,  "sigmoid", False),
-            (2, 2, 50,   50,  False, "sigmoid", False),
-        ]
+        pytest.param(2, 2, 1,    64,  False, "silu",   False, id='B2_H2_T1_D64_affineFalse_silu_biasFalse'),
+        pytest.param(2, 2, 512,  128, True,  "silu",   True, id='B2_H2_T512_D128_affineTrue_silu_biasTrue'),
+        pytest.param(2, 2, 2048, 1200, True,  "sigmoid", False, id='B2_H2_T2048_D1200_affineTrue_sigmoid_biasFalse'),
+        pytest.param(2, 2, 50,   50,  False, "sigmoid", False, id='B2_H2_T50_D50_affineFalse_sigmoid_biasFalse'),
+        pytest.param(2, 2, 32, 2048, True,  "silu", True, marks=pytest.mark.skipif(
+            not IS_NPU, reason='requires Ascend NPU'), id='B2_H2_T32_D2048_affineTrue_silu_biasTrue'),
+        pytest.param(2, 2, 32, 4096, True,  "silu", True, marks=pytest.mark.skipif(
+            not IS_NPU, reason='requires Ascend NPU'), id='B2_H2_T32_D4096_affineTrue_silu_biasTrue'),
     ],
 )
 def test_layernorm_gated(B: int, H: int, T: int, D: int, elementwise_affine: bool, activation: str, bias: bool):
@@ -71,13 +72,12 @@ def test_layernorm_gated(B: int, H: int, T: int, D: int, elementwise_affine: boo
 @pytest.mark.parametrize(
     ('B', 'H', 'T', 'D', 'activation'),
     [
-        pytest.param(*test, id=f"B{test[0]}_H{test[1]}_T{test[2]}_D{test[3]}_{test[4]}")
-        for test in [
-            (2, 2, 1,    64,  "silu"),
-            (2, 2, 512,  128, "sigmoid"),
-            (2, 2, 2048, 1200, "silu"),
-            (2, 2, 50,   50,  "sigmoid"),
-        ]
+        pytest.param(2, 2, 1,    64,  "silu", id='B2_H2_T1_D64_silu'),
+        pytest.param(2, 2, 512,  128, "sigmoid", id='B2_H2_T512_D128_sigmoid'),
+        pytest.param(2, 2, 2048, 1200, "silu", id='B2_H2_T2048_D1200_silu'),
+        pytest.param(2, 2, 50,   50,  "sigmoid", id='B2_H2_T50_D50_sigmoid'),
+        pytest.param(2, 2, 32, 4096, "silu", marks=pytest.mark.skipif(
+            not IS_NPU, reason='requires Ascend NPU'), id='B2_H2_T32_D4096_silu'),
     ],
 )
 def test_rmsnorm_gated(B: int, H: int, T: int, D: int, activation: str):
@@ -255,3 +255,147 @@ def test_groupnorm_gated(T: int, D: int, group_size: int | None, dtype: torch.dt
     names = [name for name, t in zip(('dx', 'dw', 'db', 'dz'), (x, weight, bias, z)) if t is not None]
     for name, expected, actual in zip(names, ref_grads, tri_grads):
         assert_close(name, expected, actual, tolerance)
+
+
+@pytest.mark.skipif(not IS_NPU, reason='requires Ascend NPU')
+@pytest.mark.parametrize(
+    ('arch', 'BD', 'fwd', 'bwd', 'recompute'),
+    [
+        pytest.param("Ascend950DT_9582", 128, 6.0, 8.0, 11.0, id="950dt-small"),
+        pytest.param("Ascend950DT_9582", 2048, 6.0, 24.0, 16.5, id="950dt-large"),
+        pytest.param("Ascend910B", 128, 3.0, 8.0, 11.0, id="910-small"),
+        pytest.param("Ascend910_9391", 2048, 4.0, 12.0, 16.5, id="910-large"),
+        pytest.param("", 2048, 4.0, 12.0, 16.5, id="unknown"),
+    ],
+)
+def test_ascend_norm_gated_tile_budget(monkeypatch, arch, BD, fwd, bwd, recompute):
+    from fla.modules.norm.triton_ascend import fused_norm_gate
+
+    monkeypatch.setattr(fused_norm_gate, 'get_device_arch', lambda: arch)
+    assert fused_norm_gate._fwd_memory_multiplier(BD=BD) == fwd
+    for is_rms_norm in (False, True):
+        assert fused_norm_gate._bwd_memory_multiplier(is_rms_norm=is_rms_norm, BD=BD) == bwd
+        assert fused_norm_gate._bwd_memory_multiplier(
+            is_rms_norm=is_rms_norm, BD=BD, recompute_output=True,
+        ) == recompute
+
+
+@pytest.fixture
+def ascend_norm_gated_host(monkeypatch, arch, ub_kib):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from fla.modules.norm.triton_ascend import fused_norm_gate
+    from fla.utils import ascend_ub_manager
+
+    monkeypatch.setattr(fused_norm_gate, 'get_device_arch', lambda: arch)
+    monkeypatch.setattr(ascend_ub_manager, 'get_ub_manager', lambda: SimpleNamespace(ub_capacity_bits=ub_kib * 1024 * 8))
+    monkeypatch.setattr(fused_norm_gate, 'get_multiprocessor_count', lambda index: 64)
+    monkeypatch.setattr(fused_norm_gate, 'layer_norm_gated_fwd_kernel', MagicMock())
+    monkeypatch.setattr(fused_norm_gate, 'layer_norm_gated_bwd_kernel', MagicMock())
+    return fused_norm_gate
+
+
+@pytest.mark.skipif(not IS_NPU, reason='requires Ascend NPU')
+@pytest.mark.parametrize(
+    ('arch', 'ub_kib', 'D', 'BD', 'BT', 'NS'),
+    [
+        pytest.param('Ascend950DT_9582', 248, 128, 128, 64, 2, id='950dt-d128'),
+        pytest.param('Ascend950DT_9582', 248, 1024, 1024, 8, 16, id='950dt-d1024'),
+        pytest.param('Ascend950DT_9582', 248, 1025, 2048, 4, 32, id='950dt-d1025'),
+        pytest.param('Ascend910_9382', 192, 128, 128, 64, 2, id='910-original'),
+    ],
+)
+def test_ascend_norm_gated_forward_launch(ascend_norm_gated_host, arch, ub_kib, D, BD, BT, NS):
+    x = torch.empty(128, D, device='cpu')
+    ascend_norm_gated_host.layer_norm_gated_fwd_npu(x=x, g=x, weight=None, bias=None)
+
+    kernel = ascend_norm_gated_host.layer_norm_gated_fwd_kernel
+    kernel.__getitem__.assert_called_once_with((NS,))
+    launch = kernel.__getitem__.return_value
+    launch.assert_called_once()
+    kwargs = launch.call_args.kwargs
+    assert (kwargs['BD'], kwargs['BT'], kwargs['NS']) == (BD, BT, NS)
+    for key in ('multibuffer', 'multibuffer_mode', 'set_workspace_multibuffer', 'num_warps', 'num_stages'):
+        assert key not in kwargs
+
+
+@pytest.mark.skipif(not IS_NPU, reason='requires Ascend NPU')
+@pytest.mark.parametrize(
+    ('arch', 'ub_kib', 'D', 'is_rms_norm', 'BD', 'BT', 'NS'),
+    [
+        pytest.param('Ascend950DT_9582', 248, 1024, True, 1024, 4, 32, id='950dt-small'),
+        pytest.param('Ascend950DT_9582', 248, 1200, True, 2048, 1, 64, id='950dt-rms-d1200'),
+        pytest.param('Ascend950DT_9582', 248, 2048, False, 2048, 1, 64, id='950dt-ln-d2048'),
+        pytest.param('Ascend910B', 192, 1024, True, 1024, 4, 32, id='910-original'),
+    ],
+)
+def test_ascend_norm_gated_backward_launch(ascend_norm_gated_host, arch, ub_kib, D, is_rms_norm, BD, BT, NS):
+    x = torch.empty(128, D, device='cpu')
+    ascend_norm_gated_host.layer_norm_gated_bwd_npu(dy=x, x=x, g=x, weight=None, bias=None, is_rms_norm=is_rms_norm)
+
+    kernel = ascend_norm_gated_host.layer_norm_gated_bwd_kernel
+    kernel.__getitem__.assert_called_once_with((NS,))
+    launch = kernel.__getitem__.return_value
+    launch.assert_called_once()
+    kwargs = launch.call_args.kwargs
+    assert (kwargs['BD'], kwargs['BT'], kwargs['NS']) == (BD, BT, NS)
+    assert not kwargs['RECOMPUTE_OUTPUT']
+    assert kwargs['IS_RMS_NORM'] == is_rms_norm
+    for key in ('multibuffer', 'multibuffer_mode', 'set_workspace_multibuffer', 'num_warps', 'num_stages'):
+        assert key not in kwargs
+
+
+@pytest.mark.skipif(not IS_NPU, reason='requires Ascend NPU')
+@pytest.mark.parametrize(
+    ('arch', 'ub_kib', 'D', 'recompute_output', 'BD', 'ub_single_buffer'),
+    [
+        pytest.param('Ascend950DT_9582', 248, 2049, False, 4096, True, id='950dt-aligned-d2049'),
+        pytest.param('Ascend950DT_9582', 248, 4096, False, 4096, True, id='950dt-d4096'),
+        pytest.param('Ascend950DT_9582', 248, 4097, False, 8192, False, id='950dt-d4097-default'),
+        pytest.param('Ascend950DT_9582', 248, 4096, True, 4096, False, id='950dt-recompute-default'),
+        pytest.param('Ascend910_9382', 192, 4096, False, 4096, False, id='910-original'),
+    ],
+)
+def test_ascend_norm_gated_wide_backward_launch(ascend_norm_gated_host, arch, ub_kib, D, recompute_output, BD, ub_single_buffer):
+    x = torch.empty(128, D, device='cpu')
+    ascend_norm_gated_host.layer_norm_gated_bwd_npu(
+        dy=x, x=x, g=x, weight=None, bias=None, recompute_output=recompute_output,
+    )
+
+    kernel = ascend_norm_gated_host.layer_norm_gated_bwd_kernel
+    kernel.__getitem__.assert_called_once_with((64,))
+    launch = kernel.__getitem__.return_value
+    launch.assert_called_once()
+    kwargs = launch.call_args.kwargs
+    assert (kwargs['BD'], kwargs['BT'], kwargs['NS']) == (BD, 1, 64)
+    assert kwargs['RECOMPUTE_OUTPUT'] == recompute_output
+    if ub_single_buffer:
+        assert kwargs['multibuffer_mode'] == (('gm', 2), ('l0c', 2), ('l1', 2), ('ub', 1))
+    else:
+        assert 'multibuffer_mode' not in kwargs
+    for key in ('multibuffer', 'set_workspace_multibuffer', 'num_warps', 'num_stages'):
+        assert key not in kwargs
+
+
+@pytest.mark.skipif(not IS_NPU, reason='requires Ascend NPU')
+def test_layernorm_gated_bf16_wide():
+    torch.manual_seed(42)
+    D = 4096
+    x = torch.randn(2, 2, 32, D, device=device, dtype=torch.bfloat16, requires_grad=True)
+    g = torch.randn_like(x, requires_grad=True)
+    ref = nn.LayerNorm(D, device=device)
+    tri = FusedLayerNormGated(D, bias=True, activation="silu").to(device)
+    nn.init.normal_(ref.weight)
+    nn.init.normal_(ref.bias)
+    tri.load_state_dict(ref.state_dict())
+
+    ref_y = (ref(x.float()) * F.silu(g.float())).to(x.dtype)
+    tri_y = tri(x, g)
+    do = torch.randn_like(x)
+    ref_grads = torch.autograd.grad(ref_y, (x, g, ref.weight, ref.bias), do)
+    tri_grads = torch.autograd.grad(tri_y, (x, g, tri.weight, tri.bias), do)
+    for name, expected, actual in zip(('y', 'dx', 'dg', 'dw', 'db'), (ref_y, *ref_grads), (tri_y, *tri_grads)):
+        assert torch.isfinite(expected).all()
+        assert torch.isfinite(actual).all()
+        assert_close(name, expected, actual, 5e-3)

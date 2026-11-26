@@ -205,6 +205,7 @@ jobs:
             tests/modules/test_l2norm.py \
             tests/modules/test_l2warp.py \
             tests/modules/test_layernorm.py \
+            tests/modules/test_layernorm_gated.py \
             tests/modules/test_long_conv.py \
             tests/modules/test_parallel.py \
             tests/modules/test_rotary.py \
